@@ -5,6 +5,7 @@ package chain
 
 import (
 	"context"
+	"errors"
 	"math/big"
 	"testing"
 
@@ -20,6 +21,43 @@ import (
 	"github.com/offchainlabs/nitro/solgen/go/challengeV2gen"
 	"github.com/offchainlabs/nitro/util/containers"
 )
+
+func TestScanLogRanges(t *testing.T) {
+	t.Run("bounds a large backlog without skipping blocks", func(t *testing.T) {
+		var got [][2]uint64
+		cursor, err := scanLogRanges(100, 365, 100, func(start, end uint64) error {
+			got = append(got, [2]uint64{start, end})
+			return nil
+		})
+		require.NoError(t, err)
+		require.Equal(t, uint64(365), cursor)
+		require.Equal(t, [][2]uint64{{100, 200}, {200, 300}, {300, 365}}, got)
+	})
+
+	t.Run("retry starts at the last fully scanned block", func(t *testing.T) {
+		scanError := errors.New("rpc unavailable")
+		var got [][2]uint64
+		cursor, err := scanLogRanges(100, 365, 100, func(start, end uint64) error {
+			got = append(got, [2]uint64{start, end})
+			if start == 200 {
+				return scanError
+			}
+			return nil
+		})
+		require.ErrorIs(t, err, scanError)
+		require.Equal(t, uint64(200), cursor)
+		require.Equal(t, [][2]uint64{{100, 200}, {200, 300}}, got)
+	})
+
+	t.Run("rejects zero limit", func(t *testing.T) {
+		cursor, err := scanLogRanges(100, 365, 0, func(uint64, uint64) error {
+			t.Fatal("scan should not run")
+			return nil
+		})
+		require.Error(t, err)
+		require.Equal(t, uint64(100), cursor)
+	})
+}
 
 func simpleAssertionMetadata() *state.AssociatedAssertionMetadata {
 	return &state.AssociatedAssertionMetadata{

@@ -277,28 +277,51 @@ func (w *Watcher) watchEvents(ctx context.Context) {
 				log.Error("Could not get challenge manager filterer", "err", err)
 				return
 			}
-			filterOpts := &bind.FilterOpts{
-				Start:   fromBlock,
-				End:     &toBlock,
-				Context: ctx,
-			}
-			if err = w.checkForEdgeAdded(ctx, filterer, filterOpts); err != nil {
-				log.Error("Could not check for edge added", "err", err)
+			// The initial sync is chunked, but this polling path must be chunked too:
+			// after a long RPC outage its saved cursor can lag millions of blocks.
+			// Advance the cursor only after all event types in a chunk succeed, so
+			// a retry replays at most that chunk without skipping any events.
+			fromBlock, err = scanLogRanges(fromBlock, toBlock, w.maxGetLogBlocks, func(startBlock, endBlock uint64) error {
+				filterOpts := &bind.FilterOpts{Start: startBlock, End: &endBlock, Context: ctx}
+				if err := w.checkForEdgeAdded(ctx, filterer, filterOpts); err != nil {
+					return fmt.Errorf("check for edge added: %w", err)
+				}
+				if err := w.checkForEdgeConfirmedByOneStepProof(ctx, filterer, filterOpts); err != nil {
+					return fmt.Errorf("check for edge confirmed by osp: %w", err)
+				}
+				if err := w.checkForEdgeConfirmedByTime(ctx, filterer, filterOpts); err != nil {
+					return fmt.Errorf("check for edge confirmed by time: %w", err)
+				}
+				return nil
+			})
+			if err != nil {
+				log.Error("Could not scan challenge events", "fromBlock", fromBlock, "toBlock", toBlock, "err", err)
 				continue
 			}
-			if err = w.checkForEdgeConfirmedByOneStepProof(ctx, filterer, filterOpts); err != nil {
-				log.Error("Could not check for edge confirmed by osp", "err", err)
-				continue
-			}
-			if err = w.checkForEdgeConfirmedByTime(ctx, filterer, filterOpts); err != nil {
-				log.Error("Could not check for edge confirmed by time", "err", err)
-				continue
-			}
-			fromBlock = toBlock
 		case <-ctx.Done():
 			return
 		}
 	}
+}
+
+// scanLogRanges bounds every inclusive eth_getLogs query and keeps the last
+// successful end block as the retry cursor. Adjacent ranges deliberately share
+// their boundary block, matching the watcher's existing replay behavior.
+func scanLogRanges(fromBlock, toBlock, maxGetLogBlocks uint64, scan func(startBlock, endBlock uint64) error) (uint64, error) {
+	if maxGetLogBlocks == 0 {
+		return fromBlock, fmt.Errorf("max get-log block range must be positive")
+	}
+	for fromBlock < toBlock {
+		endBlock := toBlock
+		if toBlock-fromBlock > maxGetLogBlocks {
+			endBlock = fromBlock + maxGetLogBlocks
+		}
+		if err := scan(fromBlock, endBlock); err != nil {
+			return fromBlock, err
+		}
+		fromBlock = endBlock
+	}
+	return fromBlock, nil
 }
 
 // GetRoyalEdges returns all royal, tracked edges in the watcher by assertion
